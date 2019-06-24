@@ -187,6 +187,9 @@ def get_pruning_hparams():
       exponent > 1 varies more slowly towards the end than the beginning
     use_tpu: False
       Indicates whether to use TPU
+    global_pruning: False
+      If True, ignore matrix-local thresholds. Calculate a single global threshold,
+      and prune as if all weights are a part of a single matrix.
 
     We use the following sparsity function:
 
@@ -218,7 +221,8 @@ def get_pruning_hparams():
       sparsity_function_begin_step=0,
       sparsity_function_end_step=100,
       sparsity_function_exponent=3.0,
-      use_tpu=False)
+      use_tpu=False,
+      global_pruning=False)
 
 
 class Pruning(object):
@@ -296,6 +300,15 @@ class Pruning(object):
 
     if not 0.0 <= spec.target_sparsity < 1.0:
       raise ValueError('target_sparsity must be in range [0,1)')
+
+    if spec.global_pruning and (spec.block_width > 1 or spec.block_height > 1):
+      raise ValueError(
+        'Cannot block prune and global prune at the same time. '
+        'Set either global_pruning=False or block_width=1 and block_height=1.')
+
+    if spec.global_pruning and spec.weight_sparsity_map != ['']:
+      raise ValueError(
+        'Cannot global prune and set weight sparsity map at the same time.')
 
   def _setup_global_step(self, global_step):
     graph_global_step = global_step
@@ -400,7 +413,19 @@ class Pruning(object):
       raise ValueError('Sparsity variable undefined')
 
     sparsity = self._get_sparsity(weights.op.name)
-    with ops.name_scope(weights.op.name + '_pruning_ops'):
+
+    scope_name = weights.op.name + '_pruning_ops'
+    new_threshold = self._threshold_from_weights(weights, sparsity, scope_name)
+
+    with ops.name_scope(scope_name):
+      new_mask = math_ops.cast(
+          math_ops.greater_equal(abs_weights, smoothed_threshold),
+          dtypes.float32)
+
+    return new_threshold, new_mask
+
+  def _threshold_from_weights(self, weights, sparsity, scope_name):
+    with ops.name_scope(scope_name):
       abs_weights = math_ops.abs(weights)
       k = math_ops.cast(
           math_ops.round(
@@ -416,11 +441,7 @@ class Pruning(object):
           math_ops.multiply(threshold, self._spec.threshold_decay)
       ])
 
-      new_mask = math_ops.cast(
-          math_ops.greater_equal(abs_weights, smoothed_threshold),
-          dtypes.float32)
-
-    return smoothed_threshold, new_mask
+      return smoothed_threshold
 
   def _maybe_update_block_mask(self, weights, threshold):
     """Performs block-granular masking of the weights.
@@ -495,6 +516,37 @@ class Pruning(object):
       raise ValueError(
           'Assign op list not empty. _get_mask_assign_ops() called twice?')
 
+    if self._spec.global_pruning:
+      self._get_global_mask_assign_ops()
+    else:
+      self._get_local_mask_assign_ops()
+
+  def _get_global_mask_assign_ops(self):
+    masks = get_masks()
+    weights = get_weights()
+
+    if self._sparsity is None:
+      raise ValueError('Sparsity variable undefined')
+
+    cat_weights = tf.concat([tf.reshape(weight, (-1,)) for weight in weights], axis=0)
+    new_threshold = self._threshold_from_weights(cat_weights, self._sparsity, self._spec.name)
+
+    for index, mask in enumerate(masks):
+      weight = weights[index]
+
+      is_partitioned = isinstance(weight, variables.PartitionedVariable)
+      if is_partitioned:
+        weight = weight.as_tensor()
+
+      new_mask = math_ops.cast(
+          math_ops.greater_equal(abs_weights, smoothed_threshold),
+          dtypes.float32)
+
+      self._assign_ops.append(
+          pruning_utils.partitioned_variable_assign(mask, new_mask)
+          if is_partitioned else pruning_utils.variable_assign(mask, new_mask))
+
+  def _get_local_mask_assign_ops(self):
     masks = get_masks()
     weights = get_weights()
     thresholds = get_thresholds()
